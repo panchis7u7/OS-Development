@@ -9,7 +9,7 @@ header_start:
     ; Checksum.
     dd 0x100000000 - (0xe85250d6 + 0 + (header_end - header_start))
     ; End Tag.
-    dw 0
-    dw 0
-    dd 8
+    dw 0        ; Type.
+    dw 0        ; Flags.
+    dd 8        ; Size.
 header_end:
