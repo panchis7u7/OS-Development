@@ -1,6 +1,7 @@
 section .data
-multiboot_msg db "Multiboot found.",0
-multiboot_msg_len equ $-multiboot_msg-1
+multiboot_msg db "Multiboot found!.",0
+cpuid_msg db "CPUID information found!",0
+long_mode_msg db "Long mode is supported!",0
 ok_msg db "[OK] ",0
 ok_msg_len equ $-ok_msg-1
 fail_msg db "[FAIL] ",0
@@ -35,8 +36,8 @@ start:
     ; Print OK.
     ; mov dword [0xb8000], 0x2f4b2f4f
     call check_multiboot     
-    ;call check_cpuid
-    ;call check_long_mode
+    call check_cpuid
+    call check_long_mode
 
     ; -------------------------------------------------------------------
     ; 1. Point the first entry of L4 to the first entry in the L3 table.
@@ -131,15 +132,56 @@ start:
     hlt
 
 check_multiboot:
-    cmp eax, 0x36d76289
-    jne .no_multiboot
     mov esi, ok_msg
+    mov ebx, fail_msg
+    cmp eax, 0x36d76289             ; Multiboot magic number check.
+    cmovne esi, ebx            ; Pass the okay message.
     call print
     mov esi, multiboot_msg
     call print
     ret
-.no_multiboot:
-    hlt
+
+; Flip the cpuid bit of the flags register.
+check_cpuid:
+    pushfd
+    pop eax
+    mov ecx, eax
+    xor eax, 1 << 21        ; Flip the 21 bit.
+    push eax
+    popfd
+    pushfd
+    pop eax
+    push ecx
+    popfd
+    mov esi, ok_msg
+    mov ebx, fail_msg
+    cmp eax, ecx
+    cmove esi, ebx            ; Pass the okay message.
+    call print
+    mov esi, cpuid_msg
+    call print
+    ret
+
+; Check if cpuid suppots extended processor info.
+check_long_mode:
+    mov esi, ok_msg
+    mov ecx, fail_msg
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000001
+    jl .no_long_mode
+    cmovl esi, ecx
+    mov eax, 0x80000001
+    cpuid
+    test edx, 1 << 29
+    jz .no_long_mode
+    ret
+.no_long_mode:
+    mov esi, fail_msg
+    call print
+    mov esi, cpuid_msg
+    call print
+    ret
 
 ; -------------------------------------------------------------------
 ; Input esi (data), edx (length)
@@ -152,8 +194,8 @@ print:
     mov esi, [video_space_offset]
 print_loop:
     mov edx, [ebx+ecx]                  ; Offset the characters.
-    cmp dl, 0x5B
-    cmove byte eax, edi
+    cmp dl, 0x5B                        
+    cmove eax, edi
     mov [video_space+(esi*2)], dl    ; Black Background with white text character.
     mov [video_space+(esi*2)+1], al  ; Copy the nth character to the nth + 1 address.
     inc ecx                          ; Increment counter +1.
@@ -161,6 +203,10 @@ print_loop:
     cmp dl, 0                        ; Check if string terminator was encounterd.
     je success
     jmp print_loop
+
+clr_screen:
+
+
 success:
     dec esi
     mov [video_space_offset], esi
