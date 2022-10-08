@@ -12,18 +12,35 @@ section .bss
 align 4096
 video_space_offset:
     resw 1
-p4_table:
+L4_page_table:
     resb 4096
-p3_table:
+L3_page_table:
     resb 4096
-p2_table:
+L2_page_table:
     resb 4096
 stack_bottom:
     resb 4096 * 4
 stack_top:
 
+section .rodata
+; Define Global Descriptor Table.
+gdt64:
+    dq 0    ; Zero entry.
+    ; Code Segment: 
+    ; Enable executable flag.
+    ; Set descriptor tpye for code and data segments.
+    ; Enable present flag.
+    ; Enable 64 bit flag.
+.code_segment: equ $-gdt64
+    dq (1 << 43) | (1 << 44) | (1 << 47) | (1 << 53)
+    ; Long pointer that holds 2 bytes of the length of the table
+.pointer:
+    dw $-gdt64-1
+    dq gdt64
+
 
 global start:
+extern long_mode_start
 section .text
 bits 32
 start:
@@ -38,8 +55,87 @@ start:
     call check_multiboot     
     call check_cpuid
     call check_long_mode
+    call setup_page_tables
 
-    ; -------------------------------------------------------------------
+    lgdt [gdt64.pointer]
+    jmp gdt64.code_segment:long_mode_start
+
+; -------------------------------------------------
+check_multiboot:
+    mov esi, ok_msg
+    mov ebx, fail_msg
+    cmp eax, 0x36d76289         ; Multiboot magic number check.
+    cmovne esi, ebx             ; Pass the okay message.
+    call print
+    mov esi, multiboot_msg
+    call print
+    ret
+
+; -------------------------------------------------
+; Flip the cpuid bit of the flags register.
+check_cpuid:
+    pushfd
+    pop eax
+    mov ecx, eax
+    xor eax, 1 << 21        ; Flip the 21 bit.
+    push eax
+    popfd
+    pushfd
+    pop eax
+    push ecx
+    popfd
+    mov esi, ok_msg
+    mov ebx, fail_msg
+    cmp eax, ecx
+    cmove esi, ebx            ; Pass the okay message.
+    call print
+    mov esi, cpuid_msg
+    call print
+    ret
+
+; -------------------------------------------------
+; Check if cpuid suppots extended processor info.
+check_long_mode:
+    mov esi, ok_msg
+    mov ecx, fail_msg
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000001
+    jl .no_long_mode
+    cmovl esi, ecx
+    mov eax, 0x80000001
+    cpuid
+    test edx, 1 << 29
+    jz .no_long_mode
+    ret
+.no_long_mode:
+    mov esi, fail_msg
+    call print
+    mov esi, cpuid_msg
+    call print
+    ret
+
+; ---------------------------------------------------------------------------------------
+; Paging.
+; Allows to map virtual address to physical addresses. In order to acomplish this
+; it is necessary to create page tables definin the mappings which the cpu then
+; looks at whenever you try to read or write to memory.
+;
+; A single page is a chunk of 4Kb of memory, each tabla can hold 512 entries. Each
+; virtual address takes up 48 bits pf the 64 bit available, the remaining bits are
+; unused. The CPU treats the first 9 bits as an index into the L4 page table and the 
+; corresponding entry will point to a L3 page table, the CPU then uses the next 9
+; bits to index into this L3 page table, yielding an entry pointing to a L2 page
+; table. This continues until we reach the L1 page table where the entry now points
+; to the start of a page in physical memory. The final bits of the virtual address
+; are used as an offset in this physical page. The cpu determines tha address of the
+; L4 page table at any moment by reading the pointer stored in the CR3 register.
+setup_page_tables:
+    
+    ; We need to do identity mapping where we map a physicall address to the exact
+    ; same virtual address.Becauls paging will be enabled automatically as soon as
+    ; enable long mode.
+    ;
     ; 1. Point the first entry of L4 to the first entry in the L3 table.
     ; 2. Each entry in a page table contains an address, but it also 
     ; contains metadata about that page. The first two bits are the 
@@ -48,15 +144,15 @@ start:
     ; second, we say “this page is allowed to be written to.”
     ; 3. The 0 is intended to convey to the reader that we’re accessing 
     ; the zeroth entry in the page table.   
-    mov eax, p3_table
-    or eax, 0b11    
-    mov dword [p4_table + 0], eax
+    mov eax, L3_page_table
+    or eax, 0b11                            ; Present, Writable flags.
+    mov dword [L4_page_table + 0], eax
 
     ; -------------------------------------------------------------------
     ; 1. Point the first entry of L3 to the first entry in the L2 table.
-    mov eax, p2_table
+    mov eax, L2_page_table
     or eax, 0b11
-    mov dword [p3_table + 0], eax
+    mov dword [L3_page_table + 0], eax
 
     ; -------------------------------------------------------------------
     ; 1. Point each table L2 entry to a page.
@@ -70,32 +166,34 @@ start:
     mov eax, 0x200000   ; Each page is 2MiB in size. 
     mul ecx
     or eax, 0b10000011
-    mov [p2_table + ecx * 8], eax
+    mov [L2_page_table + ecx * 8], eax
 
     inc eax
     cmp ecx, 512
     jne .map_p2_table
 
+enable_paging:
     ; -------------------------------------------------------------------
     ; 1. Now that we have a valid page table, we need to inform the 
     ; hardware about it. cr3 is a special register, called a 
     ; ‘control register’, hence the cr. The cr registers are special: 
     ; they control how the CPU actually works. In our case, the cr3 
     ; register needs to hold the location of the page table.
-    mov eax, p4_table
+    mov eax, L4_page_table
     mov cr3, eax
 
     ; -------------------------------------------------------------------
     ; Enable physical address extension "PAE".
     ; In order to set PAE, we need to take the value in the cr4 register 
     ; and modify it. So first, we mov it into eax, then we use or to change 
-    ; the value. What about 1 << 5? The << is a ‘left shift’.
+    ; the value. What about 1 << 5? The << is a ‘left shift’. This is necesary 
+    ; for 64 bit paging.
     mov eax, cr4
     or eax, 1 << 5
     mov cr4, eax
 
     ; -------------------------------------------------------------------
-    ; Set ling mode bit.
+    ; Set long mode bit.
     ; The rdmsr and wrmsr instructions read and write to a ‘model specific 
     ; register’, hence msr. This is just what you have to do to set this up.
     mov ecx, 0xC0000080
@@ -129,58 +227,6 @@ start:
     ; ‘code segment’
     ; ‘data segment’
 
-    hlt
-
-check_multiboot:
-    mov esi, ok_msg
-    mov ebx, fail_msg
-    cmp eax, 0x36d76289             ; Multiboot magic number check.
-    cmovne esi, ebx            ; Pass the okay message.
-    call print
-    mov esi, multiboot_msg
-    call print
-    ret
-
-; Flip the cpuid bit of the flags register.
-check_cpuid:
-    pushfd
-    pop eax
-    mov ecx, eax
-    xor eax, 1 << 21        ; Flip the 21 bit.
-    push eax
-    popfd
-    pushfd
-    pop eax
-    push ecx
-    popfd
-    mov esi, ok_msg
-    mov ebx, fail_msg
-    cmp eax, ecx
-    cmove esi, ebx            ; Pass the okay message.
-    call print
-    mov esi, cpuid_msg
-    call print
-    ret
-
-; Check if cpuid suppots extended processor info.
-check_long_mode:
-    mov esi, ok_msg
-    mov ecx, fail_msg
-    mov eax, 0x80000000
-    cpuid
-    cmp eax, 0x80000001
-    jl .no_long_mode
-    cmovl esi, ecx
-    mov eax, 0x80000001
-    cpuid
-    test edx, 1 << 29
-    jz .no_long_mode
-    ret
-.no_long_mode:
-    mov esi, fail_msg
-    call print
-    mov esi, cpuid_msg
-    call print
     ret
 
 ; -------------------------------------------------------------------
@@ -203,10 +249,6 @@ print_loop:
     cmp dl, 0                        ; Check if string terminator was encounterd.
     je success
     jmp print_loop
-
-clr_screen:
-
-
 success:
     dec esi
     mov [video_space_offset], esi
