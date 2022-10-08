@@ -1,4 +1,5 @@
 global long_mode_start
+extern kmain
 
 section .text
 bits 64
